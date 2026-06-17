@@ -53,6 +53,10 @@ PANEL_BORDER = (0, 60, 0)
 ACCENT_GREEN = (0, 140, 40)
 YELLOW = (255, 255, 0)
 ORANGE = (255, 120, 0)
+PURPLE = (180, 80, 255)
+DIM_PURPLE = (80, 40, 120)
+BRIGHT_PURPLE = (220, 140, 255)
+WIFI_SCAN_INTERVAL = 20
 
 SAMPLE_RATE = 44100
 
@@ -503,6 +507,154 @@ class BluetoothScanner:
             self.last_scan = time.time()
 
 
+class WifiNetwork:
+    def __init__(self, ssid, bssid, signal, auth, encryption, channel, band, radio_type):
+        self.ssid = ssid
+        self.bssid = bssid
+        self.signal = signal
+        self.auth = auth
+        self.encryption = encryption
+        self.channel = channel
+        self.band = band
+        self.radio_type = radio_type
+        self.first_seen = time.time()
+        self.last_seen = time.time()
+        self.angle = 0.0
+        self.distance = 0.0
+        self._assign_position()
+
+    def _assign_position(self):
+        h = hashlib.md5(self.bssid.encode()).hexdigest()
+        self.angle = (int(h[:8], 16) / 0xFFFFFFFF) * 2 * math.pi
+        self.distance = 0.1 + (1.0 - self.signal / 100.0) * 0.8
+
+    def radar_pos(self, center, radius):
+        r = self.distance * radius
+        x = center[0] + r * math.cos(self.angle)
+        y = center[1] + r * math.sin(self.angle)
+        return int(x), int(y)
+
+    @property
+    def display_name(self):
+        return self.ssid if self.ssid else "(Hidden)"
+
+    @property
+    def is_open(self):
+        return self.auth.lower() in ("open", "")
+
+    @property
+    def security_level(self):
+        a = self.auth.lower()
+        if "wpa3" in a:
+            return 3
+        if "wpa2" in a:
+            return 2
+        if "wpa" in a:
+            return 1
+        return 0
+
+    @property
+    def vendor(self):
+        return lookup_mac_vendor(self.bssid)
+
+
+class WifiScanner:
+    def __init__(self):
+        self.networks = {}
+        self.scanning = False
+        self.last_scan = 0
+
+    def scan(self):
+        if self.scanning:
+            return
+        self.scanning = True
+        threading.Thread(target=self._do_scan, daemon=True).start()
+
+    def _do_scan(self):
+        try:
+            result = subprocess.run(
+                ["netsh", "wlan", "show", "networks", "mode=bssid"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self._parse_output(result.stdout)
+        except Exception:
+            pass
+        finally:
+            self.scanning = False
+            self.last_scan = time.time()
+
+    def _parse_output(self, output):
+        current_ssid = ""
+        current_auth = ""
+        current_enc = ""
+        current_bssid = ""
+        current_signal = 0
+        current_channel = 0
+        current_band = ""
+        current_radio = ""
+
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("SSID") and "BSSID" not in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    current_ssid = parts[1].strip()
+            elif line.startswith("Authentication"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    current_auth = parts[1].strip()
+            elif line.startswith("Encryption"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    current_enc = parts[1].strip()
+            elif line.startswith("BSSID"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    current_bssid = parts[1].strip()
+            elif line.startswith("Signal"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    try:
+                        current_signal = int(parts[1].strip().replace("%", ""))
+                    except ValueError:
+                        current_signal = 0
+            elif line.startswith("Channel"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    try:
+                        current_channel = int(parts[1].strip())
+                    except ValueError:
+                        current_channel = 0
+            elif line.startswith("Band"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    current_band = parts[1].strip()
+            elif line.startswith("Radio type"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    current_radio = parts[1].strip()
+
+            if current_bssid and current_signal > 0:
+                bssid_key = current_bssid.upper()
+                if bssid_key in self.networks:
+                    net = self.networks[bssid_key]
+                    net.signal = current_signal
+                    net.last_seen = time.time()
+                    net._assign_position()
+                else:
+                    self.networks[bssid_key] = WifiNetwork(
+                        current_ssid, current_bssid, current_signal,
+                        current_auth, current_enc, current_channel,
+                        current_band, current_radio,
+                    )
+                current_bssid = ""
+                current_signal = 0
+                current_channel = 0
+                current_band = ""
+                current_radio = ""
+
+
 # ─── VISUAL HELPERS ──────────────────────────────────────────────────────────
 
 def build_vignette(w, h):
@@ -565,7 +717,9 @@ class UAVRadar:
 
         self.start_time = time.time()
         self.bt_scanner = BluetoothScanner()
+        self.wifi_scanner = WifiScanner()
         self.show_bt = True
+        self.show_wifi = True
         self.selected_id = None
         self.selected_type = None
         self.hidden_devices = set()
@@ -589,9 +743,12 @@ class UAVRadar:
         self.noise_timer = 0
         self.noise_surface = self._build_noise()
 
+        self._prev_wifi_bssids = set()
+
         self.sound.play_startup()
         self.scanner.scan()
         self.bt_scanner.scan()
+        self.wifi_scanner.scan()
         self.sound.play_scan_start()
 
     def _build_noise(self):
@@ -617,6 +774,7 @@ class UAVRadar:
                     if event.key == pygame.K_r:
                         self.scanner.scan()
                         self.bt_scanner.scan()
+                        self.wifi_scanner.scan()
                         self.sound.play_scan_start()
                         self.scan_count += 1
                         self._log_event("Manual rescan triggered")
@@ -624,6 +782,8 @@ class UAVRadar:
                         self.sound.toggle_mute()
                     if event.key == pygame.K_b:
                         self.show_bt = not self.show_bt
+                    if event.key == pygame.K_w:
+                        self.show_wifi = not self.show_wifi
                     if event.key == pygame.K_DELETE or event.key == pygame.K_x:
                         self._delete_selected()
                     if event.key == pygame.K_t:
@@ -672,6 +832,11 @@ class UAVRadar:
                     and not self.bt_scanner.scanning):
                 self.bt_scanner.scan()
 
+            if (self.show_wifi
+                    and time.time() - self.wifi_scanner.last_scan > WIFI_SCAN_INTERVAL
+                    and not self.wifi_scanner.scanning):
+                self.wifi_scanner.scan()
+
             self._check_new_devices()
 
             self.noise_timer += dt
@@ -712,6 +877,18 @@ class UAVRadar:
                     closest_dist = dist
                     closest_id = addr
                     closest_type = "bt"
+
+        if self.show_wifi:
+            for bssid, net in self.wifi_scanner.networks.items():
+                if bssid in self.hidden_devices:
+                    continue
+                pos = net.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+                dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_id = bssid
+                    closest_type = "wifi"
 
         self.selected_id = closest_id
         self.selected_type = closest_type
@@ -767,8 +944,20 @@ class UAVRadar:
             self.alert_queue.append(("BT DEVICE", name, time.time(), CYAN))
             self.total_devices_ever += 1
 
+        current_wifi = set(self.wifi_scanner.networks.keys())
+        new_wifi = current_wifi - self._prev_wifi_bssids
+        for bssid in new_wifi:
+            net = self.wifi_scanner.networks[bssid]
+            name = net.display_name
+            sec = "OPEN" if net.is_open else net.auth
+            self._log_event(f"WiFi+ {name} ({sec})")
+            color = RED if net.is_open else PURPLE
+            self.alert_queue.append(("WIFI NETWORK", f"{name} ch{net.channel}", time.time(), color))
+            self.total_devices_ever += 1
+
         self._prev_net_macs = current_net
         self._prev_bt_addrs = current_bt
+        self._prev_wifi_bssids = current_wifi
 
     def _port_scan_selected(self):
         if self.selected_id is None or self.selected_type != "net":
@@ -836,6 +1025,18 @@ class UAVRadar:
                     closest_id = addr
                     closest_type = "bt"
 
+        if self.show_wifi:
+            for bssid, net in self.wifi_scanner.networks.items():
+                if bssid in self.hidden_devices:
+                    continue
+                pos = net.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+                dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_id = bssid
+                    closest_type = "wifi"
+
         self.hover_id = closest_id
         self.hover_type = closest_type
 
@@ -885,6 +1086,27 @@ class UAVRadar:
                         f.write(f"    Note: {note}\n")
                     f.write(f"    Last seen: {age}s ago\n\n")
 
+            if self.wifi_scanner.networks:
+                f.write(f"\nWIFI NETWORKS ({len(self.wifi_scanner.networks)})\n")
+                f.write(f"{'-' * 60}\n")
+                for bssid, net in self.wifi_scanner.networks.items():
+                    if bssid in self.hidden_devices:
+                        continue
+                    tag = self.tagged_devices.get(bssid, "")
+                    age = int(now - net.last_seen)
+                    sec = "OPEN" if net.is_open else net.auth
+                    f.write(f"  SSID: {net.display_name:20s}  BSSID: {net.bssid}\n")
+                    f.write(f"    Auth: {sec}  Encrypt: {net.encryption}  Ch: {net.channel}\n")
+                    if net.band:
+                        f.write(f"    Band: {net.band}  Radio: {net.radio_type}\n")
+                    vendor = net.vendor
+                    if vendor:
+                        f.write(f"    Vendor: {vendor}\n")
+                    f.write(f"    Signal: {net.signal}%\n")
+                    if tag:
+                        f.write(f"    Tag: {tag}\n")
+                    f.write(f"    Last seen: {age}s ago\n\n")
+
             f.write(f"\nHidden devices: {len(self.hidden_devices)}\n")
         self.export_flash = time.time()
 
@@ -900,6 +1122,8 @@ class UAVRadar:
         self._draw_devices()
         if self.show_bt:
             self._draw_bt_devices()
+        if self.show_wifi:
+            self._draw_wifi_networks()
         self._draw_connection_line()
         self._draw_crosshair()
         self._draw_hud()
@@ -1172,6 +1396,86 @@ class UAVRadar:
                 self.screen.blit(bg, (pos[0] - 20, pos[1] - 16))
                 self.screen.blit(new_surf, (pos[0] - 18, pos[1] - 15))
 
+    def _draw_wifi_networks(self):
+        now = time.time()
+        for bssid, net in list(self.wifi_scanner.networks.items()):
+            if bssid in self.hidden_devices:
+                continue
+            pos = net.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+            is_selected = (bssid == self.selected_id and self.selected_type == "wifi")
+
+            angle_diff = (self.sweep_angle - net.angle) % (2 * math.pi)
+            pulse = max(0, 1.0 - angle_diff / 0.3) if angle_diff < 0.3 else 0
+
+            if is_selected:
+                sel_size = 18 + int(3 * math.sin(now * 4))
+                sel_surf = pygame.Surface((sel_size * 2, sel_size * 2), pygame.SRCALPHA)
+                pygame.draw.circle(sel_surf, (255, 255, 255, 80), (sel_size, sel_size), sel_size, 2)
+                self.screen.blit(sel_surf, (pos[0] - sel_size, pos[1] - sel_size))
+
+            tag = self.tagged_devices.get(bssid)
+            if tag:
+                tag_colors = {"KNOWN": GREEN, "SUSPECT": AMBER, "TARGET": RED}
+                tc = tag_colors.get(tag, GREEN)
+                tag_surf = self.font_tiny.render(tag, True, tc)
+                self.screen.blit(tag_surf, (pos[0] + 14, pos[1] + 24))
+
+            if net.is_open:
+                base_color = RED
+                glow_color = (255, 60, 60)
+            else:
+                sl = net.security_level
+                if sl >= 3:
+                    base_color = BRIGHT_PURPLE
+                    glow_color = (180, 100, 255)
+                elif sl >= 2:
+                    base_color = PURPLE
+                    glow_color = (140, 60, 220)
+                else:
+                    base_color = DIM_PURPLE
+                    glow_color = (100, 40, 160)
+
+            size = 5 + int(2 * pulse)
+            glow_r = size + 6 + int(4 * pulse)
+            glow = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
+            glow_a = int(30 + 55 * pulse)
+            pygame.draw.circle(glow, (*glow_color, glow_a), (glow_r, glow_r), glow_r)
+            self.screen.blit(glow, (pos[0] - glow_r, pos[1] - glow_r))
+
+            # WiFi icon: concentric arcs
+            for arc_i in range(3):
+                arc_r = size + 2 + arc_i * 4
+                rect = pygame.Rect(pos[0] - arc_r, pos[1] - arc_r, arc_r * 2, arc_r * 2)
+                pygame.draw.arc(self.screen, base_color, rect, 0.3, 1.25, 2)
+            pygame.draw.circle(self.screen, base_color, pos, size - 1)
+
+            label_text = net.display_name[:18]
+            if net.is_open:
+                label_text += " [OPEN]"
+            label_color = BRIGHT_PURPLE if pulse > 0 else PURPLE
+            if net.is_open:
+                label_color = RED
+            label = self.font_small.render(label_text, True, label_color)
+            self.screen.blit(label, (pos[0] + 14, pos[1] - 6))
+
+            sig_text = self.font_tiny.render(f"{net.signal}% ch{net.channel}", True, DIM_PURPLE)
+            self.screen.blit(sig_text, (pos[0] + 14, pos[1] + 8))
+            strength = max(0, min(4, net.signal // 25))
+            bar_x = pos[0] + 14 + sig_text.get_width() + 4
+            bar_y = pos[1] + 10
+            for b in range(4):
+                h = 3 + b * 2
+                c = base_color if b < strength else (30, 30, 30)
+                pygame.draw.rect(self.screen, c, (bar_x + b * 5, bar_y + (10 - h), 3, h))
+
+            is_new = (now - net.first_seen) < 30
+            if is_new and int(now * 3) % 2 == 0:
+                new_surf = self.font_tiny.render("NEW", True, BRIGHT_PURPLE)
+                bg = pygame.Surface((new_surf.get_width() + 4, new_surf.get_height() + 2), pygame.SRCALPHA)
+                bg.fill((40, 10, 60, 180))
+                self.screen.blit(bg, (pos[0] - 20, pos[1] - 16))
+                self.screen.blit(new_surf, (pos[0] - 18, pos[1] - 15))
+
     def _draw_connection_line(self):
         if self.selected_id is None:
             return
@@ -1181,6 +1485,8 @@ class UAVRadar:
             dev = self.scanner.devices[self.selected_id]
         elif self.selected_type == "bt" and self.selected_id in self.bt_scanner.devices:
             dev = self.bt_scanner.devices[self.selected_id]
+        elif self.selected_type == "wifi" and self.selected_id in self.wifi_scanner.networks:
+            dev = self.wifi_scanner.networks[self.selected_id]
         if dev is None:
             return
 
@@ -1191,7 +1497,12 @@ class UAVRadar:
         if dist < 5:
             return
 
-        color = CYAN if self.selected_type == "bt" else BRIGHT_GREEN
+        if self.selected_type == "bt":
+            color = CYAN
+        elif self.selected_type == "wifi":
+            color = PURPLE
+        else:
+            color = BRIGHT_GREEN
         now = time.time()
         num_dashes = int(dist / 10)
         for i in range(num_dashes):
@@ -1242,6 +1553,17 @@ class UAVRadar:
             lines.append(f"RSSI: {dev.rssi}dBm" if dev.rssi else "RSSI: N/A")
             if dev.apple_services:
                 lines.append(f"Apple: {', '.join(dev.apple_services[:2])}")
+        elif self.hover_type == "wifi" and self.hover_id in self.wifi_scanner.networks:
+            net = self.wifi_scanner.networks[self.hover_id]
+            lines.append(net.display_name)
+            sec = "OPEN" if net.is_open else net.auth
+            lines.append(f"Auth: {sec}")
+            lines.append(f"Signal: {net.signal}%  Ch: {net.channel}")
+            if net.band:
+                lines.append(f"Band: {net.band}")
+            vendor = net.vendor
+            if vendor:
+                lines.append(f"Vendor: {vendor}")
         else:
             return
 
@@ -1401,6 +1723,27 @@ class UAVRadar:
             if dev.rssi:
                 strength = max(0, min(100, 100 + dev.rssi))
                 lines.append(("SIGNAL", f"{strength}%", CYAN))
+        elif self.selected_type == "wifi" and self.selected_id in self.wifi_scanner.networks:
+            net = self.wifi_scanner.networks[self.selected_id]
+            lines.append(("TYPE", "WIFI NETWORK", PURPLE))
+            lines.append(("SSID", net.display_name, WHITE))
+            lines.append(("BSSID", net.bssid, WHITE))
+            vendor = net.vendor
+            if vendor:
+                lines.append(("VENDOR", vendor, AMBER))
+            lines.append(("AUTH", net.auth or "Open", RED if net.is_open else WHITE))
+            lines.append(("ENCRYPT", net.encryption or "None", WHITE))
+            lines.append(("CHANNEL", str(net.channel), WHITE))
+            if net.band:
+                lines.append(("BAND", net.band, WHITE))
+            if net.radio_type:
+                lines.append(("RADIO", net.radio_type, WHITE))
+            lines.append(("SIGNAL", f"{net.signal}%", BRIGHT_PURPLE))
+            age = int(time.time() - net.last_seen)
+            first = int(time.time() - net.first_seen)
+            lines.append(("SEEN", f"{age}s ago (first: {first}s)", DIM_PURPLE))
+            if net.is_open:
+                lines.append(("ALERT", "OPEN NETWORK - NO ENCRYPTION", RED))
         else:
             self.selected_id = None
             self.selected_type = None
@@ -1462,7 +1805,7 @@ class UAVRadar:
         # ─── TOP-RIGHT: STATUS ───────────────────────────────────────────
         status_w = 290
         status_x = SCREEN_W - status_w - 10
-        draw_panel(self.screen, status_x, 10, status_w, 130)
+        draw_panel(self.screen, status_x, 10, status_w, 148)
 
         device_count = len([m for m in self.scanner.devices if m not in self.hidden_devices])
         bt_count = len([a for a in self.bt_scanner.devices if a not in self.hidden_devices])
@@ -1488,12 +1831,21 @@ class UAVRadar:
         bt = self.font_med.render(bt_text, True, bt_color)
         self.screen.blit(bt, (status_x + 12, 78))
 
+        wifi_count = len([b for b in self.wifi_scanner.networks if b not in self.hidden_devices])
+        wifi_open = sum(1 for n in self.wifi_scanner.networks.values() if n.is_open)
+        wifi_color = PURPLE if wifi_count > 0 else DIM_PURPLE
+        wifi_text = f"WIFI: {wifi_count}"
+        if wifi_open > 0:
+            wifi_text += f"  OPEN: {wifi_open}"
+        wf = self.font_med.render(wifi_text, True, wifi_color)
+        self.screen.blit(wf, (status_x + 12, 94))
+
         if not self.bt_scanner.enabled:
             nb = self.font_tiny.render("(bleak not installed)", True, DIM_RED)
-            self.screen.blit(nb, (status_x + 12, 96))
+            self.screen.blit(nb, (status_x + 12, 112))
         elif self.bt_scanner.scanning and blink:
             bs = self.font_tiny.render("[ BT SCANNING... ]", True, CYAN)
-            self.screen.blit(bs, (status_x + 12, 96))
+            self.screen.blit(bs, (status_x + 12, 112))
 
         uptime = int(time.time() - self.start_time)
         mins, secs = divmod(uptime, 60)
@@ -1502,11 +1854,11 @@ class UAVRadar:
             f"UP: {hrs:02d}:{mins:02d}:{secs:02d}  TOTAL: {self.total_devices_ever}  SCANS: {self.scan_count}",
             True, DIM_GREEN,
         )
-        self.screen.blit(stats, (status_x + 12, 112))
+        self.screen.blit(stats, (status_x + 12, 130))
 
         # ─── RIGHT PANEL: DEVICE LIST ────────────────────────────────────
         panel_x = SCREEN_W - 300
-        panel_y = 130
+        panel_y = 148
         panel_w = 285
 
         net_devices = [d for m, d in self.scanner.devices.items() if m not in self.hidden_devices]
@@ -1570,17 +1922,49 @@ class UAVRadar:
                 if len(bt_devs) > 8:
                     more = self.font_tiny.render(f"+{len(bt_devs) - 8} more", True, DIM_CYAN)
                     self.screen.blit(more, (panel_x + 10, panel_y + bt_h - 14))
+                panel_y += bt_h + 6
+
+        if self.show_wifi:
+            wifi_nets = [n for b, n in self.wifi_scanner.networks.items() if b not in self.hidden_devices]
+            wifi_vis = wifi_nets[:6]
+            if wifi_vis:
+                wifi_h = 28 + len(wifi_vis) * 20
+                draw_panel(self.screen, panel_x, panel_y, panel_w, wifi_h, border_color=DIM_PURPLE)
+
+                wifi_hdr = self.font_small.render("WIFI NETWORKS", True, PURPLE)
+                self.screen.blit(wifi_hdr, (panel_x + 10, panel_y + 6))
+                pygame.draw.line(self.screen, DIM_PURPLE, (panel_x + 8, panel_y + 22),
+                                 (panel_x + panel_w - 8, panel_y + 22), 1)
+
+                for i, net in enumerate(wifi_vis):
+                    y = panel_y + 26 + i * 20
+                    if net.is_open:
+                        color, tag = RED, " [OPEN]"
+                    elif net.security_level >= 3:
+                        color, tag = BRIGHT_PURPLE, " [WPA3]"
+                    elif net.security_level >= 2:
+                        color, tag = PURPLE, " [WPA2]"
+                    else:
+                        color, tag = DIM_PURPLE, " [WPA]"
+                    name = net.display_name[:12]
+                    text = f"{name:12s} {net.signal:>3d}%{tag}"
+                    line = self.font_small.render(text, True, color)
+                    self.screen.blit(line, (panel_x + 10, y))
+
+                if len(wifi_nets) > 6:
+                    more = self.font_tiny.render(f"+{len(wifi_nets) - 6} more", True, DIM_PURPLE)
+                    self.screen.blit(more, (panel_x + 10, panel_y + wifi_h - 14))
 
         # ─── BOTTOM BAR ──────────────────────────────────────────────────
         bar_y = SCREEN_H - 38
         draw_panel(self.screen, 10, bar_y, SCREEN_W - 20, 28)
 
-        mute_s = "ON" if self.sound.muted else "OFF"
         bt_s = "ON" if self.show_bt else "OFF"
+        wifi_s = "ON" if self.show_wifi else "OFF"
         hidden = len(self.hidden_devices)
-        hidden_str = f"  HIDDEN:{hidden}" if hidden > 0 else ""
+        hidden_str = f" HID:{hidden}" if hidden > 0 else ""
         controls = self.font_small.render(
-            f"[R]Scan [B]BT:{bt_s} [T]ag [X]Del [P]ort [S]ave [U]nhide [F12]Snap{hidden_str} [ESC]",
+            f"[R]Scan [B]BT:{bt_s} [W]iFi:{wifi_s} [T]ag [X]Del [P]ort [S]ave [U]nhide{hidden_str} [ESC]",
             True, BRIGHT_GREEN,
         )
         self.screen.blit(controls, (22, bar_y + 7))
